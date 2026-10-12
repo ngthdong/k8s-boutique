@@ -1,0 +1,15 @@
+# Installed by ansible-galaxy install -r requirements.yml
+/roles/
+/collections/
+
+# Vagrant state, including the generated SSH private keys.
+/.vagrant/
+
+# Never commit credentials: kubeconfig files contain a cluster-admin certificate.
+*kubeconfig*
+admin.conf
+*.pem
+*.key
+
+*.retry
+__pycache__/

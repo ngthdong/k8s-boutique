@@ -1,0 +1,12 @@
+---
+ansible_user: vagrant
+
+# Vagrant writes one private key per machine and per provider, at
+# .vagrant/machines/<name>/<provider>/private_key. Use whichever exists, so the
+# same inventory works with VirtualBox and with libvirt. The keys only exist
+# after `vagrant up` has finished.
+vagrant_machine_dir: "{{ inventory_dir }}/.vagrant/machines/{{ inventory_hostname }}"
+ansible_ssh_private_key_file: >-
+  {{ [vagrant_machine_dir ~ '/virtualbox/private_key', vagrant_machine_dir ~ '/libvirt/private_key']
+     | select('file') | first
+     | default(vagrant_machine_dir ~ '/virtualbox/private_key') }}

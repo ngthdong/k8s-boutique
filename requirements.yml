@@ -1,0 +1,21 @@
+---
+# ansible-galaxy install -r requirements.yml
+# Roles land in ./roles and collections in ./collections (see ansible.cfg).
+roles:
+  - name: geerlingguy.containerd
+    version: 1.4.1
+  - name: geerlingguy.kubernetes
+    version: 8.2.0
+  - name: geerlingguy.helm
+    version: 1.0.1
+
+collections:
+  # helm, helm_repository, helm_plugin, k8s, k8s_info, k8s_drain, k8s_log.
+  - name: kubernetes.core
+    version: ">=6.2.0,<7.0.0"
+  # modprobe, used here and by geerlingguy.kubernetes.
+  - name: community.general
+    version: ">=8.0.0"
+  # sysctl, used here and by geerlingguy.kubernetes.
+  - name: ansible.posix
+    version: ">=1.5.0"

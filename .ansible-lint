@@ -1,0 +1,6 @@
+---
+# Installed dependencies and Helm charts are not Ansible content.
+exclude_paths:
+  - roles/
+  - collections/
+  - charts/
