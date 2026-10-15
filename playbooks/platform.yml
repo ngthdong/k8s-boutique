@@ -1,0 +1,59 @@
+---
+- name: Install the Ingress controller and metrics-server
+  hosts: k8s_master
+  become: true 
+
+  module_defaults: 
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+    group/kubernetes.core.helm:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+  
+  tasks: 
+    - name: Add the chart repositories.
+      kubernetes.core.helm_repository:
+        name: "{{ item.name }}"
+        repo_url: "{{ item.url }}"
+      loop:
+        - {name: traefik, url: "https://traefik.github.io/charts"}
+        - {name: metrics-server, url: "https://kubernetes-sigs.github.io/metrics-server/"}
+    
+    # There is no cloud load balancer on a kubeadm cluster, so Traefik is
+    # published on fixed NodePorts. Every node forwards them to Traefik.
+    - name: Install Traefik.
+      kubernetes.core.helm:
+        name: traefik
+        chart_ref: traefik/traefik
+        chart_version: "{{ traefik_chart_version }}"
+        release_namespace: traefik
+        create_namespace: true
+        wait: true
+        values: >-
+          {{ {
+               'ingressClass': {'enabled': true, 'isDefaultClass': true, 'name': 'traefik'},
+               'service': {'spec': {'type': 'NodePort'}},
+               'ports': {
+                 'web': {'nodePort': ingress_http_node_port | int},
+                 'websecure': {'nodePort': ingress_https_node_port | int}
+               }
+             } }}
+    
+    - name: Install metrics-server.
+      kubernetes.core.helm:
+        name: metrics-server
+        chart_ref: metrics-server/metrics-server
+        chart_version: "{{ metrics_server_chart_version }}"
+        release_namespace: kube-system
+        wait: true
+        values:
+          args:
+            - --kubelet-insecure-tls
+
+    - name: Wait until the metrics API serves node metrics.
+      kubernetes.core.k8s_info:
+        api_version: metrics.k8s.io/v1beta1
+        kind: NodeMetrics
+      register: node_metrics
+      until: node_metrics.resources | default([]) | length == groups['k8s'] | length
+      retries: 30
+      delay: 10

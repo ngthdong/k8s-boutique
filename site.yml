@@ -1,0 +1,12 @@
+---
+- name: Build the Kubernetes cluster.
+  ansible.builtin.import_playbook: playbooks/cluster.yml
+
+- name: Install the Ingress controller and metrics-server.
+  ansible.builtin.import_playbook: playbooks/platform.yml
+
+- name: Deploy the Online Boutique.
+  ansible.builtin.import_playbook: playbooks/deploy.yml
+
+- name: Verify everything.
+  ansible.builtin.import_playbook: playbooks/verify.yml
