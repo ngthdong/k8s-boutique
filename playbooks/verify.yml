@@ -1,0 +1,262 @@
+---
+# Part 4: prove that the deployment works. Every check is an assertion, so the
+# first failure stops the play.
+#
+#   ansible-playbook playbooks/verify.yml
+
+- name: Verify the cluster and the Online Boutique.
+  hosts: k8s_master
+  become: true
+
+  vars_files:
+    - ../vars/microservices.yml
+
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+
+  vars:
+    worker_ip: "{{ hostvars[groups['k8s_nodes'][0]]['ansible_host'] }}"
+    storefront_url: >-
+      {{ 'http://' ~ worker_ip ~ ':' ~ ingress_http_node_port
+         if frontend_exposure == 'ingress'
+         else 'http://' ~ worker_ip ~ ':' ~ frontend_node_port | default('') }}
+    storefront_headers: >-
+      {{ {'Host': ingress_host} if frontend_exposure == 'ingress' else {} }}
+    expected_apps: "{{ microservices | map(attribute='app') | list }}"
+
+  tasks:
+    # -------------------------------------------------------------- nodes
+    - name: Read the nodes.
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: verify_nodes
+
+    - name: Both nodes are registered and Ready.
+      ansible.builtin.assert:
+        that:
+          - verify_nodes.resources | map(attribute='metadata.name') | sort == groups['k8s'] | sort
+          - verify_nodes.resources
+            | map(attribute='status.conditions') | flatten
+            | selectattr('type', 'equalto', 'Ready')
+            | selectattr('status', 'equalto', 'True')
+            | list | length == groups['k8s'] | length
+        fail_msg: "Nodes: {{ verify_nodes.resources | map(attribute='metadata.name') | list }}"
+
+    # Trap 2: a node must register its private-network address, not the NAT one.
+    # Trap 1: Flannel must tunnel to that same address.
+    - name: Each node uses its private-network address, for the kubelet and for Flannel.
+      ansible.builtin.assert:
+        that:
+          - internal_ip == hostvars[node.metadata.name]['ansible_host']
+          - flannel_ip == hostvars[node.metadata.name]['ansible_host']
+        fail_msg: >-
+          {{ node.metadata.name }}: kubelet InternalIP {{ internal_ip }}, Flannel
+          public-ip {{ flannel_ip }}, expected {{ hostvars[node.metadata.name]['ansible_host'] }}.
+        quiet: true
+      vars:
+        internal_ip: >-
+          {{ node.status.addresses | selectattr('type', 'equalto', 'InternalIP')
+             | map(attribute='address') | first | default('none') }}
+        flannel_ip: "{{ node.metadata.annotations['flannel.alpha.coreos.com/public-ip'] | default('none') }}"
+      loop: "{{ verify_nodes.resources }}"
+      loop_control:
+        loop_var: node
+        label: "{{ node.metadata.name }}"
+
+    # ------------------------------------------------------- workloads
+    - name: Read the Deployments and Services in the application namespace.
+      kubernetes.core.k8s_info:
+        kind: "{{ item }}"
+        namespace: "{{ microservices_namespace }}"
+      register: verify_objects
+      loop:
+        - Deployment
+        - Service
+
+    - name: Keep the Deployments and Services.
+      ansible.builtin.set_fact:
+        deployments: "{{ verify_objects.results[0].resources }}"
+        services: "{{ verify_objects.results[1].resources }}"
+
+    - name: All eleven Deployments exist, under the expected names.
+      ansible.builtin.assert:
+        that:
+          - deployments | map(attribute='metadata.name') | sort == expected_apps | sort
+        fail_msg: >-
+          Expected {{ expected_apps | sort }},
+          found {{ deployments | map(attribute='metadata.name') | sort }}.
+
+    - name: Every Deployment has all its replicas available.
+      ansible.builtin.assert:
+        that:
+          - item.status.availableReplicas | default(0) == item.spec.replicas
+        fail_msg: >-
+          {{ item.metadata.name }}: {{ item.status.availableReplicas | default(0) }}
+          of {{ item.spec.replicas }} replicas available.
+        quiet: true
+      loop: "{{ deployments }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: The checkout service exists under its real name, and the upstream default name does not.
+      ansible.builtin.assert:
+        that:
+          - "'checkoutservice' in deployments | map(attribute='metadata.name')"
+          - "'checkoutservice' in services | map(attribute='metadata.name')"
+          - "'servicename' not in deployments | map(attribute='metadata.name')"
+          - "'servicename' not in services | map(attribute='metadata.name')"
+
+    # The checkout bug in one sentence: a caller was configured with a Service
+    # name that did not exist. Check every such address, not only that one.
+    - name: Collect every *_ADDR address that a service is configured to call.
+      ansible.builtin.set_fact:
+        service_calls: "{{ service_calls | default([]) + calls }}"
+      vars:
+        calls: >-
+          {{ item.spec.template.spec.containers[0].env | default([])
+             | selectattr('name', 'match', '.*_ADDR$')
+             | map('combine', {'caller': item.metadata.name}) | list }}
+      loop: "{{ deployments }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Every such address resolves to a Service and port that exist.
+      ansible.builtin.assert:
+        that:
+          - target_host in service_ports
+          - (target_port | int) in service_ports[target_host] | default([])
+        fail_msg: >-
+          {{ item.caller }} calls {{ item.name }}={{ item.value }}, but there is
+          no Service {{ target_host }} with port {{ target_port }}.
+        quiet: true
+      vars:
+        service_ports: >-
+          {{ dict(services | map(attribute='metadata.name')
+                  | zip(services | map(attribute='spec.ports')
+                        | map('map', attribute='port') | map('list'))) }}
+        target_host: "{{ item.value.split(':')[0] }}"
+        target_port: "{{ item.value.split(':')[-1] }}"
+      loop: "{{ service_calls }}"
+      loop_control:
+        label: "{{ item.caller }}: {{ item.name }}={{ item.value }}"
+
+    - name: Probes are configured on at least four Deployments.
+      ansible.builtin.assert:
+        that:
+          - probed | length >= 4
+        fail_msg: "Only {{ probed | length }} Deployments have liveness and readiness probes."
+      vars:
+        probed: >-
+          {{ deployments | map(attribute='spec.template.spec.containers') | map('first')
+             | selectattr('livenessProbe', 'defined') | selectattr('readinessProbe', 'defined') | list }}
+
+    # ------------------------------------------------------ exposure
+    - name: Check how the frontend is exposed.
+      ansible.builtin.assert:
+        that: frontend_svc.spec.type == ('ClusterIP' if frontend_exposure == 'ingress' else 'NodePort')
+        fail_msg: "The frontend Service is a {{ frontend_svc.spec.type }}."
+      vars:
+        frontend_svc: "{{ services | selectattr('metadata.name', 'equalto', 'frontend') | first }}"
+
+    - name: Remember the frontend NodePort.
+      ansible.builtin.set_fact:
+        frontend_node_port: >-
+          {{ (services | selectattr('metadata.name', 'equalto', 'frontend') | first).spec.ports[0].nodePort | default('') }}
+      when: frontend_exposure == 'nodeport'
+
+    - name: Read the frontend Ingress.
+      kubernetes.core.k8s_info:
+        kind: Ingress
+        name: frontend
+        namespace: "{{ microservices_namespace }}"
+      register: frontend_ingress
+      when: frontend_exposure == 'ingress'
+
+    - name: The Ingress routes the storefront hostname to the frontend Service.
+      ansible.builtin.assert:
+        that:
+          - frontend_ingress.resources | length == 1
+          - rule.host == ingress_host
+          - rule.http.paths[0].backend.service.name == 'frontend'
+      vars:
+        rule: "{{ frontend_ingress.resources[0].spec.rules[0] | default({}) }}"
+      when: frontend_exposure == 'ingress'
+
+    # ------------------------------------------- end to end, from the host
+    # These requests are made from the machine running Ansible, the way a
+    # browser reaches the storefront.
+    - name: Request the storefront home page.
+      ansible.builtin.uri:
+        url: "{{ storefront_url }}/"
+        headers: "{{ storefront_headers }}"
+        return_content: true
+      register: home_page
+      delegate_to: localhost
+      become: false
+
+    - name: The home page is the Online Boutique, with products from the catalogue.
+      ansible.builtin.assert:
+        that:
+          - home_page.status == 200
+          - "'<title>Online Boutique</title>' in home_page.content"
+          - "'Vintage Typewriter' in home_page.content"
+
+    - name: Request the same address with a hostname the Ingress does not know.
+      ansible.builtin.uri:
+        url: "{{ storefront_url }}/"
+        headers:
+          Host: unknown.{{ ingress_host }}
+        status_code: [404]
+      delegate_to: localhost
+      become: false
+      when: frontend_exposure == 'ingress'
+
+    # The checkout path exercises checkoutservice, cartservice, paymentservice,
+    # shippingservice, emailservice and currencyservice together.
+    - name: Start a shopping session for the checkout test.
+      ansible.builtin.set_fact:
+        verify_session: "verify-{{ lookup('ansible.builtin.password', '/dev/null', chars=['ascii_lowercase', 'digits'], length=12) }}"
+
+    - name: Add a product to the cart.
+      ansible.builtin.uri:
+        url: "{{ storefront_url }}/cart"
+        method: POST
+        headers: "{{ storefront_headers | combine({'Cookie': 'shop_session-id=' ~ verify_session}) }}"
+        body_format: form-urlencoded
+        body:
+          product_id: OLJCESPC7Z
+          quantity: 1
+        follow_redirects: none
+        status_code: [302, 303]
+      delegate_to: localhost
+      become: false
+
+    - name: Place the order.
+      ansible.builtin.uri:
+        url: "{{ storefront_url }}/cart/checkout"
+        method: POST
+        headers: "{{ storefront_headers | combine({'Cookie': 'shop_session-id=' ~ verify_session}) }}"
+        body_format: form-urlencoded
+        body:
+          email: someone@example.com
+          street_address: 1600 Amphitheatre Parkway
+          zip_code: "94043"
+          city: Mountain View
+          state: CA
+          country: United States
+          credit_card_number: 4432-8015-6152-0454
+          credit_card_expiration_month: "1"
+          credit_card_expiration_year: "{{ now().year + 1 }}"
+          credit_card_cvv: "672"
+        return_content: true
+      register: order_page
+      delegate_to: localhost
+      become: false
+
+    - name: The order went through every backend service.
+      ansible.builtin.assert:
+        that:
+          - "'Your order is complete!' in order_page.content"
+        success_msg: Storefront, cart and checkout all work.
+        

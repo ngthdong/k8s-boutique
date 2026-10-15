@@ -1,0 +1,33 @@
+---
+- name: Remove the Online Boutique.
+  hosts: k8s_master
+  become: true
+
+  vars_files:
+    - ../vars/microservices.yml
+
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+    group/kubernetes.core.helm:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+
+  tasks:
+    - name: Uninstall every Helm release.
+      kubernetes.core.helm:
+        name: "{{ item.name }}"
+        release_namespace: "{{ microservices_namespace }}"
+        state: absent
+        wait: true
+      loop: "{{ microservices }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Delete the namespace and everything left in it.
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: "{{ microservices_namespace }}"
+        state: absent
+        wait: true
+        wait_timeout: 300
