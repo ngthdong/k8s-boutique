@@ -1,0 +1,39 @@
+---
+kubernetes_version: '1.35'
+flannel_version: v0.28.10
+helm_version: v3.21.4
+helm_diff_version: v3.15.15
+traefik_chart_version: 41.7.1
+metrics_server_chart_version: 3.14.0
+
+k8s_master_ip: "{{ hostvars[groups['k8s_master'][0]]['ansible_host'] }}"
+
+flannel_pin_interface: true
+flannel_iface_can_reach: 192.168.56.1
+
+k8s_pin_node_ip: true
+
+node_dns_servers: 
+  - 192.168.121.1
+
+# geerlingguy.containerd
+containerd_config_default_write: false
+
+# geerlingguy.kubernetes
+kubernetes_allow_pods_on_control_plane: false
+kubernetes_apiserver_advertise_address: "{{ k8s_master_ip }}"
+kubernetes_kubelet_extra_args: "{{ '--node-ip=' ~ ansible_host if k8s_pin_node_ip | bool else '' }}"
+kubernetes_pod_network:
+  cni: flannel
+  cidr: 10.244.0.0/16
+# Path on the control plane of the Flannel manifest prepared by cluster.yml.
+kubernetes_flannel_manifest_file: /root/kube-flannel.yml
+
+# Talking to the cluster.
+k8s_kubeconfig: /etc/kubernetes/admin.conf
+
+# How the storefront is reached from the host.
+frontend_exposure: ingress
+ingress_host: boutique.local
+ingress_http_node_port: 30080
+ingress_https_node_port: 30443

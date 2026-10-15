@@ -1,0 +1,217 @@
+---
+# Build a two-node kubeadm cluster on the vagrant VMs.
+
+- name: Prepare everay node for K8s.
+  hosts: k8s
+  become: true
+  force_handlers: true
+
+  handlers: 
+    - name: Restart systemd-resolved.
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted
+
+    - name: Restart containerd.
+      ansible.builtin.service:
+        name: containerd
+        state: restarted
+
+  tasks: 
+    - name: Check that the inventory address is configured on this node 
+      ansible.builtin.assert:
+        that: ansible_host in ansible_facts.all_ipv4_addresses
+        fail_msg: >-
+          {{ ansible_host }} is not an address of {{ inventory_hostname }}
+          (it has {{ ansible_facts.all_ipv4_addresses | join(', ') }}).
+          Check the private network in the Vagrantfile.
+        quiet: true
+    
+    - name: Create the systemd-resolved drop-in inventory.
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: node_dns_servers | length > 0
+    
+    - name: Use the configured DNS servers.
+      ansible.builtin.copy:
+        dest: /etc/systemd/resolved.conf.d/k8s-lab-dns.conf
+        content: |
+          # Managed by Ansible (playbooks/cluster.yml).
+          [Resolve]
+          DNS=
+          DNS={{ node_dns_servers | join(' ') }}
+          DNSSEC=no
+          DNSOverTLS=no
+        owner: root
+        group: root
+        mode: "0644"
+      when: node_dns_servers | length > 0
+      notify: Restart systemd-resolved.
+
+    - name: Apply the DNS settings now.
+      ansible.builtin.meta: flush_handlers
+
+    # Every later stage downloads packages, keys or images.
+    - name: Check that the node can resolve external names.
+      ansible.builtin.command: getent hosts download.docker.com
+      register: dns_check
+      changed_when: false
+      retries: 5
+      delay: 3
+      until: dns_check.rc == 0
+  
+    # The kubelet refuses to start while swap is on.
+    - name: Turn swap off now.
+      ansible.builtin.command: swapoff -a
+      when: ansible_facts.swaptotal_mb | int > 0
+      changed_when: true
+
+    - name: Keep swap off after a reboot.
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#\s]\S*\s+\S+\s+swap\s.*)$'
+        replace: '# \1'
+
+    # containerd needs overlayfs. br_netfilter lets iptables see bridged pod
+    # traffic, and without IP forwarding the kernel drops pod traffic between
+    # nodes.
+    - name: Load the kernel modules now and at every boot.
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+        persistent: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Enable IP forwarding and bridged traffic filtering.
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        value: "1"
+        sysctl_file: /etc/sysctl.d/99-kubernetes.conf
+        reload: true
+      loop:
+        - net.ipv4.ip_forward
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+
+    - name: Install containerd.
+      ansible.builtin.import_role:
+        name: geerlingguy.containerd
+
+    # The kubelet uses the systemd cgroup driver, so containerd must use it
+    # too. The default configuration is regenerated on every run and only this
+    # one setting is changed, so the file is identical on a second run.
+    - name: Read containerd's default configuration.
+      ansible.builtin.command: containerd config default
+      register: containerd_default_config
+      changed_when: false
+
+    - name: Check that the default configuration contains the setting to change.
+      ansible.builtin.assert:
+        that: "'SystemdCgroup = false' in containerd_default_config.stdout"
+        fail_msg: containerd's default configuration no longer contains 'SystemdCgroup = false'.
+        quiet: true
+
+    - name: Configure containerd with the systemd cgroup driver.
+      ansible.builtin.copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_default_config.stdout | replace('SystemdCgroup = false', 'SystemdCgroup = true') }}\n"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart containerd.
+
+    - name: Restart containerd now if its configuration changed.
+      ansible.builtin.meta: flush_handlers
+
+    - name: Check that the running containerd serves the CRI API.
+      ansible.builtin.command: ctr plugins ls
+      register: containerd_plugins
+      changed_when: false
+      failed_when: >-
+        containerd_plugins.rc != 0
+        or containerd_plugins.stdout is not search('io\.containerd\.grpc\.v1\s+cri\s.*\sok')
+    
+- name: Prepare the Plannel manifest for the private network.
+  hosts: k8s_master 
+  become: true 
+  tasks: 
+    - name: Download and patch the Plannel manifest.
+      ansible.builtin.import_tasks: tasks/flannel-manifest.yml
+    
+- name: Initialize the control plane and join the worker.
+  hosts: k8s 
+  become: true
+  roles:
+    - role: geerlingguy.kubernetes
+
+- name: Install Helm and wait for the cluster to be ready.
+  hosts: k8s_master
+  become: true
+
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+    group/kubernetes.core.helm:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+  
+  roles:
+    - role: geerlingguy.helm
+  
+  tasks: 
+    - name: Install pip, git and curl on the control plane.
+      ansible.builtin.apt:
+        name:
+          - python3-pip
+          - git
+          - curl
+        state: present
+    
+    - name: Install the Kubernetes Python client.
+      ansible.builtin.pip:
+        name: kubernetes>=24.2.0
+        state: present
+
+    - name: Install the helm-diff plugin.
+      kubernetes.core.helm_plugin:
+        plugin_path: https://github.com/databus23/helm-diff
+        plugin_version: "{{ helm_diff_version }}"
+        state: present
+
+    - name: Wait until every node is registered and Ready.
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: cluster_nodes
+      until: >-
+        cluster_nodes.resources | length == groups['k8s'] | length
+        and cluster_nodes.resources
+            | map(attribute='status.conditions') | flatten
+            | selectattr('type', 'equalto', 'Ready')
+            | selectattr('status', 'equalto', 'True')
+            | list | length == groups['k8s'] | length
+      retries: 60
+      delay: 10
+    
+    - name: Wait until every system pod is Running and Ready.
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ item }}"
+      register: system_pods
+      until: >-
+        system_pods.resources | length > 0
+        and system_pods.resources
+            | map(attribute='status.conditions') | map('default', [])
+            | map('selectattr', 'type', 'equalto', 'Ready')
+            | map('selectattr', 'status', 'equalto', 'True')
+            | map('list') | select | list | length == system_pods.resources | length
+      retries: 60
+      delay: 10
+      loop:
+        - kube-system
+        - kube-flannel
+        

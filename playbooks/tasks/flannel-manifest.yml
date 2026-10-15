@@ -1,0 +1,50 @@
+
+# Writes the Flannel manifest that the cluster applies, to
+# kubernetes_flannel_manifest_file on the control plane.
+#
+# With flannel_pin_interface, Flannel gets --iface-can-reach so that it uses
+# the private network; without it, the manifest is the upstream one, unchanged.
+# The upstream download is kept as a separate file, so the applied manifest is
+# rebuilt from the same input on every run and the tasks stay idempotent.
+- name: Download the upstream Flannel manifest.
+  ansible.builtin.get_url:
+    url: "https://github.com/flannel-io/flannel/releases/download/{{ flannel_version }}/kube-flannel.yml"
+    dest: "/root/kube-flannel-{{ flannel_version }}.upstream.yml"
+    mode: "0644"
+    timeout: 60
+  register: flannel_download
+  retries: 5
+  delay: 10
+  until: flannel_download is succeeded
+
+- name: Read the upstream Flannel manifest.
+  ansible.builtin.slurp:
+    src: "/root/kube-flannel-{{ flannel_version }}.upstream.yml"
+  register: flannel_upstream
+
+- name: Add --iface-can-reach after --kube-subnet-mgr, if requested.
+  ansible.builtin.set_fact:
+    flannel_manifest: >-
+      {{ flannel_upstream.content | b64decode
+         | regex_replace('(?m)^(\s+)- --kube-subnet-mgr$',
+                         '\g<1>- --kube-subnet-mgr\n\g<1>- --iface-can-reach=' ~ flannel_iface_can_reach)
+         if flannel_pin_interface | bool
+         else flannel_upstream.content | b64decode }}
+
+- name: Check that the flag appears exactly as often as intended.
+  ansible.builtin.assert:
+    that:
+      - flannel_manifest.split('- --iface-can-reach=') | length - 1 == (1 if flannel_pin_interface | bool else 0)
+    fail_msg: >-
+      The Flannel manifest does not contain the expected --iface-can-reach
+      argument. The format of the upstream manifest may have changed.
+    quiet: true
+
+- name: Write the Flannel manifest the cluster applies.
+  ansible.builtin.copy:
+    dest: "{{ kubernetes_flannel_manifest_file }}"
+    content: "{{ flannel_manifest }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  register: flannel_manifest_file
