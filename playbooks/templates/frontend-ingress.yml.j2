@@ -1,0 +1,19 @@
+# Routes the storefront hostname to the frontend Service through Traefik.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend
+  namespace: {{ microservices_namespace }}
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: {{ ingress_host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

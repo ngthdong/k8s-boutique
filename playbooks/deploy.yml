@@ -1,0 +1,101 @@
+---
+- name: Deploy the Online Boutique.
+  hosts: k8s_master
+  become: true
+
+  vars_files:
+    - ../vars/microservices.yml
+    - ../vars/resources.yml
+
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+    group/kubernetes.core.helm:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+
+  tasks:
+    - name: Clone the upstream charts and values files at a fixed commit.
+      ansible.builtin.git:
+        repo: "{{ microservices_repo }}"
+        dest: "{{ src }}"
+        version: "{{ microservices_repo_version }}"
+
+    - name: Copy our vendored charts to the control plane.
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../charts/"
+        dest: "{{ charts_dest }}/"
+        owner: root
+        group: root
+        mode: "0644"
+        directory_mode: "0755"
+
+    - name: Deploy each microservice as its own Helm release.
+      kubernetes.core.helm:
+        name: "{{ item.name }}"
+        chart_ref: "{{ charts_dest }}/{{ item.chart }}"
+        release_namespace: "{{ microservices_namespace }}"
+        create_namespace: true
+        # The upstream values file, unchanged...
+        values_files:
+          - "{{ src }}/{{ item.values_file }}"
+        # ...and ours, applied last, so they win.
+        values: "{{ release_values }}"
+      vars:
+        measured: "{{ measured_resources[item.app] | default({}) }}"
+        fault: >-
+          {{ {'livenessProbe': {'grpc': {'port': 1}}} if probe_fault == item.name else {} }}
+        release_values: >-
+          {{ common
+             | combine({'resources': measured} if measured else {})
+             | combine(item.overrides | default({}), recursive=true)
+             | combine(fault, recursive=true) }}
+      loop: "{{ microservices }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Route the storefront hostname to the frontend.
+      kubernetes.core.k8s:
+        state: "{{ 'present' if frontend_exposure == 'ingress' else 'absent' }}"
+        template: frontend-ingress.yml.j2
+
+    # With two frontend replicas, a voluntary disruption such as kubectl drain
+    # may evict one of them, but never both at once.
+    - name: Protect the frontend during voluntary disruptions.
+      kubernetes.core.k8s:
+        state: present
+        template: frontend-pdb.yml.j2
+
+    - name: Wait until every Deployment has all its replicas available.
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ microservices_namespace }}"
+      register: boutique_deployments
+      until: >-
+        boutique_deployments.resources | length >= microservices | length
+        and boutique_deployments.resources
+            | selectattr('status.availableReplicas', 'defined')
+            | selectattr('status.updatedReplicas', 'defined')
+            | list | length == boutique_deployments.resources | length
+        and boutique_deployments.resources
+            | map(attribute='status.availableReplicas') | list
+            == boutique_deployments.resources | map(attribute='spec.replicas') | list
+      retries: 60
+      delay: 10
+      when: probe_fault == ""
+
+    - name: Read the frontend Service.
+      kubernetes.core.k8s_info:
+        kind: Service
+        name: frontend
+        namespace: "{{ microservices_namespace }}"
+      register: frontend_service
+
+    - name: Print the storefront URL.
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'http://' ~ hostvars[groups['k8s_nodes'][0]]['ansible_host'] ~ ':'
+             ~ frontend_service.resources[0].spec.ports[0].nodePort ~ '/'
+             if frontend_exposure == 'nodeport'
+             else 'http://' ~ ingress_host ~ ':' ~ ingress_http_node_port ~ '/  (add "'
+             ~ hostvars[groups['k8s_nodes'][0]]['ansible_host'] ~ ' ' ~ ingress_host
+             ~ '" to /etc/hosts on your machine)' }}

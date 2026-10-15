@@ -1,0 +1,12 @@
+# Voluntary disruptions (kubectl drain, node upgrades) may only evict a
+# frontend pod while at least this many stay available.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+  namespace: {{ microservices_namespace }}
+spec:
+  minAvailable: {{ frontend_pdb_min_available | int }}
+  selector:
+    matchLabels:
+      app: frontend

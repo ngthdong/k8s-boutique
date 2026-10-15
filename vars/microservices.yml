@@ -1,0 +1,152 @@
+---
+# The Online Boutique, as eleven Helm releases.
+#
+# Each release is rendered from one of our vendored charts (charts/), with the
+# upstream values file passed to Helm unchanged, and our values layered on top:
+#
+#   values_files: [upstream values file]          # from the clone, never edited
+#   values:       common + item.overrides + ...   # ours, applied last, winning
+
+# The upstream repository, cloned on the control plane at a fixed commit so
+# that a rebuild uses exactly the same values files.
+microservices_repo: https://github.com/iankisali/microservice-deployment.git
+microservices_repo_version: 8ed96c8d98625c73b67c7172b6703383ea9e46e9
+src: /opt/microservice-deployment
+
+# Where our vendored charts are copied on the control plane.
+charts_dest: /opt/boutique-charts
+
+microservices_namespace: microservice
+
+# Applied to every release.
+# Upstream asks for two replicas of everything: over twenty pods, which one
+# 4 GB worker cannot schedule. One replica each still exercises every service.
+# It also fixes redis-cart: two replicas behind one Service, each with its own
+# emptyDir, would split every cart in two.
+common:
+  appReplicas: 1
+
+# Probe building blocks. Every gRPC service in Online Boutique implements the
+# standard gRPC health service, which the kubelet can call directly.
+probe_timing:
+  readiness: &readiness_timing
+    periodSeconds: 5
+    failureThreshold: 3
+  liveness: &liveness_timing
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    failureThreshold: 3
+
+microservices:
+  - name: rediscart
+    app: redis-cart
+    chart: redis
+    values_file: values/redis-values.yaml
+    overrides:
+      readinessProbe: {tcpSocket: {port: 6379}, <<: *readiness_timing}
+      livenessProbe: {tcpSocket: {port: 6379}, <<: *liveness_timing}
+
+  - name: emailservice
+    app: emailservice
+    chart: microservice
+    values_file: values/email-service-values.yaml
+    overrides:
+      readinessProbe: {grpc: {port: 8080}, <<: *readiness_timing}
+      livenessProbe: {grpc: {port: 8080}, <<: *liveness_timing}
+
+  - name: cartservice
+    app: cartservice
+    chart: microservice
+    values_file: values/cart-service-values.yaml
+    overrides:
+      readinessProbe: {grpc: {port: 7070}, <<: *readiness_timing}
+      livenessProbe: {grpc: {port: 7070}, <<: *liveness_timing}
+
+  - name: currencyservice
+    app: currencyservice
+    chart: microservice
+    values_file: values/currency-service-values.yaml
+    overrides:
+      readinessProbe: {grpc: {port: 7000}, <<: *readiness_timing}
+      livenessProbe: {grpc: {port: 7000}, <<: *liveness_timing}
+
+  - name: paymentservice
+    app: paymentservice
+    chart: microservice
+    values_file: values/payment-service-values.yaml
+    overrides:
+      readinessProbe: {grpc: {port: 50051}, <<: *readiness_timing}
+      livenessProbe: {grpc: {port: 50051}, <<: *liveness_timing}
+
+  - name: recommendationservice
+    app: recommendationservice
+    chart: microservice
+    values_file: values/recommendation-service-values.yaml
+    overrides:
+      readinessProbe: {grpc: {port: 8080}, <<: *readiness_timing}
+      livenessProbe: {grpc: {port: 8080}, <<: *liveness_timing}
+
+  - name: productcatalogservice
+    app: productcatalogservice
+    chart: microservice
+    values_file: values/productcatalog-service-values.yaml
+    overrides:
+      readinessProbe: {grpc: {port: 3550}, <<: *readiness_timing}
+      livenessProbe: {grpc: {port: 3550}, <<: *liveness_timing}
+
+  - name: shippingservice
+    app: shippingservice
+    chart: microservice
+    values_file: values/shipping-service-values.yaml
+    overrides:
+      readinessProbe: {grpc: {port: 50051}, <<: *readiness_timing}
+      livenessProbe: {grpc: {port: 50051}, <<: *liveness_timing}
+
+  # The Java service needs longer to start than the others.
+  - name: adservice
+    app: adservice
+    chart: microservice
+    values_file: values/ad-service-values.yaml
+    overrides:
+      readinessProbe: {grpc: {port: 9555}, <<: *readiness_timing}
+      livenessProbe: {grpc: {port: 9555}, initialDelaySeconds: 40, periodSeconds: 15, failureThreshold: 3}
+
+  # Upstream bug: the values file sets appImage twice and appName never, so
+  # the chart falls back to its default name, "servicename", while the frontend
+  # calls checkoutservice:5050. Set checkout_bug_reproduce=true to deploy the
+  # upstream behaviour on purpose (Bug diagnosis).
+  - name: checkoutservice
+    app: checkoutservice
+    chart: microservice
+    values_file: values/checkout-service-values.yaml
+    overrides: >-
+      {{ ({} if checkout_bug_reproduce | default(false) | bool else {'appName': 'checkoutservice'})
+         | combine({'readinessProbe': {'grpc': {'port': 5050}, 'periodSeconds': 5, 'failureThreshold': 3},
+                    'livenessProbe': {'grpc': {'port': 5050}, 'initialDelaySeconds': 15, 'periodSeconds': 10, 'failureThreshold': 3}}) }}
+
+  # Upstream asks for a LoadBalancer. On bare-metal kubeadm nothing provisions
+  # one, so it would stay <pending> forever.
+  - name: frontendservice
+    app: frontend
+    chart: microservice
+    values_file: values/frontend-values.yaml
+    overrides:
+      serviceType: "{{ 'NodePort' if frontend_exposure == 'nodeport' else 'ClusterIP' }}"
+      appReplicas: "{{ frontend_replicas | int }}"
+      readinessProbe:
+        httpGet: {path: /_healthz, port: 8080, httpHeaders: [{name: Cookie, value: shop_session-id=x-readiness-probe}]}
+        <<: *readiness_timing
+      livenessProbe:
+        httpGet: {path: /_healthz, port: 8080, httpHeaders: [{name: Cookie, value: shop_session-id=x-liveness-probe}]}
+        <<: *liveness_timing
+
+# Scaling (done through Ansible): the frontend runs two replicas so that the
+# PodDisruptionBudget below can allow one of them to be evicted.
+frontend_replicas: 2
+frontend_pdb_min_available: 1
+
+# Fault injection for the probe demonstration:
+#   ansible-playbook playbooks/deploy.yml -e probe_fault=currencyservice
+# points that release's liveness probe at a closed port, so the kubelet
+# restarts the container again and again. Run deploy.yml without it to recover.
+probe_fault: ""
