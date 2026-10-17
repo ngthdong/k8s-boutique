@@ -1,0 +1,275 @@
+---
+# Network diagnosis: undo one of the two Vagrant networking fixes on the
+# running cluster, observe what breaks, then put it back.
+#
+#   ansible-playbook playbooks/network-experiment.yml -e experiment=flannel
+#       Flannel without --iface-can-reach: it picks the default-route interface.
+#   ansible-playbook playbooks/network-experiment.yml -e experiment=kubelet
+#       kubelet without --node-ip: it registers the default-route address.
+#   ansible-playbook playbooks/network-experiment.yml -e experiment=none
+#       Both fixes back in place.
+#
+# On libvirt, add -e isolate_mgmt=true. The VMs' default-route interface is on
+# vagrant-libvirt's management network, where (unlike VirtualBox NAT) they can
+# reach each other, so without a fix the cluster still works, only over the
+# wrong network. isolate_mgmt drops traffic between the nodes' management
+# addresses, the way separate NAT networks would. The host can still reach
+# both VMs (vagrant ssh) and Ansible uses the private network. Any run without
+# isolate_mgmt=true removes the rules again.
+#
+# Each run ends by collecting the same evidence: the addresses each node
+# registered, the address Flannel tunnels to, whether a pod on the worker can
+# reach a pod on the control plane, and whether the API server can fetch the
+# logs of a pod on the worker.
+
+- name: Check the requested experiment.
+  hosts: k8s_master
+  gather_facts: false
+  tasks:
+    - name: Check the experiment name.
+      ansible.builtin.assert:
+        that: experiment | default('') in ['flannel', 'kubelet', 'none']
+        fail_msg: "Use -e experiment=flannel, -e experiment=kubelet or -e experiment=none."
+        quiet: true
+
+- name: Configure the kubelet node IP.
+  hosts: k8s
+  become: true
+  vars:
+    pin: "{{ experiment != 'kubelet' }}"
+  handlers:
+    - name: Restart the kubelet so that it registers its address again.
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+  tasks:
+    - name: Set or clear --node-ip in the kubelet environment file.
+      ansible.builtin.lineinfile:
+        path: /etc/default/kubelet
+        regexp: '^KUBELET_EXTRA_ARGS='
+        line: "KUBELET_EXTRA_ARGS={{ '--node-ip=' ~ ansible_host if pin | bool else '' }}"
+      notify: Restart the kubelet so that it registers its address again.
+
+- name: Configure the Flannel interface.
+  hosts: k8s_master
+  become: true
+  vars:
+    flannel_pin_interface: "{{ experiment != 'flannel' }}"
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+  tasks:
+    - name: Rebuild the Flannel manifest.
+      ansible.builtin.import_tasks: tasks/flannel-manifest.yml
+
+    # Changing the DaemonSet's arguments makes Kubernetes replace the Flannel
+    # pods one node at a time.
+    - name: Apply the Flannel manifest.
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ kubernetes_flannel_manifest_file }}"
+        apply: true
+
+    - name: Wait until Flannel runs everywhere with the new arguments.
+      kubernetes.core.k8s_info:
+        kind: DaemonSet
+        name: kube-flannel-ds
+        namespace: kube-flannel
+      register: flannel_ds
+      until: >-
+        flannel_ds.resources | length == 1
+        and flannel_ds.resources[0].status.updatedNumberScheduled | default(0)
+            == flannel_ds.resources[0].status.desiredNumberScheduled
+        and flannel_ds.resources[0].status.numberReady | default(0)
+            == flannel_ds.resources[0].status.desiredNumberScheduled
+      retries: 30
+      delay: 10
+
+- name: Isolate the nodes from each other on the management network, or stop isolating them.
+  hosts: k8s
+  become: true
+  vars:
+    isolate: "{{ isolate_mgmt | default(false) | bool }}"
+    own_mgmt_ip: "{{ ansible_facts.default_ipv4.address | default('') }}"
+    peer_mgmt_ips: >-
+      {{ groups['k8s'] | difference([inventory_hostname])
+         | map('extract', hostvars, ['ansible_facts', 'default_ipv4', 'address'])
+         | select('string') | list }}
+  tasks:
+    # On VirtualBox every VM's NAT address is 10.0.2.15: the peers' address is
+    # this node's own address, and dropping it would cut this node off itself.
+    - name: Check that the nodes have distinct management addresses.
+      ansible.builtin.assert:
+        that:
+          - peer_mgmt_ips | length == groups['k8s'] | length - 1
+          - own_mgmt_ip not in peer_mgmt_ips
+          - peer_mgmt_ips | select('in', groups['k8s'] | map('extract', hostvars, 'ansible_host') | list) | list | length == 0
+        fail_msg: >-
+          isolate_mgmt only applies when each node has its own management
+          address (libvirt). Here: {{ own_mgmt_ip }} and {{ peer_mgmt_ips }}.
+        quiet: true
+      when: isolate
+
+    - name: Drop traffic arriving from the other nodes' management addresses.
+      ansible.builtin.iptables:
+        chain: INPUT
+        source: "{{ item }}"
+        jump: DROP
+        action: insert
+        comment: network-experiment isolate_mgmt
+        state: "{{ 'present' if isolate else 'absent' }}"
+      loop: "{{ peer_mgmt_ips }}"
+
+    - name: Drop traffic leaving for the other nodes' management addresses.
+      ansible.builtin.iptables:
+        chain: OUTPUT
+        destination: "{{ item }}"
+        jump: DROP
+        action: insert
+        comment: network-experiment isolate_mgmt
+        state: "{{ 'present' if isolate else 'absent' }}"
+      loop: "{{ peer_mgmt_ips }}"
+
+- name: Collect the evidence.
+  hosts: k8s_master
+  become: true
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+  vars:
+    probe_ns: default
+    control_plane: "{{ groups['k8s_master'][0] }}"
+    worker: "{{ groups['k8s_nodes'][0] }}"
+  tasks:
+    # The kubelet reports its addresses every few seconds after a restart.
+    - name: Give the nodes time to report their addresses again.
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: Read the nodes.
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: experiment_nodes
+
+    - name: Show the address each node registered and the address Flannel uses.
+      ansible.builtin.debug:
+        msg: "{{ item.metadata.name }}: InternalIP {{ internal_ip }}, Flannel public-ip {{ flannel_ip }}"
+      vars:
+        internal_ip: >-
+          {{ item.status.addresses | selectattr('type', 'equalto', 'InternalIP')
+             | map(attribute='address') | join(', ') }}
+        flannel_ip: "{{ item.metadata.annotations['flannel.alpha.coreos.com/public-ip'] | default('none') }}"
+      loop: "{{ experiment_nodes.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Remove test pods left over from an earlier run.
+      kubernetes.core.k8s:
+        state: absent
+        kind: Pod
+        namespace: "{{ probe_ns }}"
+        label_selectors:
+          - app=network-experiment
+        wait: true
+
+    - name: Start a web server pod on the control plane.
+      kubernetes.core.k8s:
+        state: present
+        wait: true
+        wait_timeout: 120
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: net-server
+            namespace: "{{ probe_ns }}"
+            labels:
+              app: network-experiment
+          spec:
+            nodeName: "{{ control_plane }}"
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+            containers:
+              - name: main
+                image: busybox:1.36
+                command: ["sh", "-c", "echo pod-network-ok > /tmp/index.html && httpd -f -p 8080 -h /tmp"]
+      register: net_server
+
+    # Pod-to-pod traffic between nodes goes through the Flannel VXLAN tunnel.
+    # The client writes its result to its termination message, which the API
+    # server stores in the pod status: reading it does not involve the kubelet,
+    # so this check does not depend on the second trap.
+    - name: From a pod on the worker, fetch the page served by the pod on the control plane.
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: net-client
+            namespace: "{{ probe_ns }}"
+            labels:
+              app: network-experiment
+          spec:
+            nodeName: "{{ worker }}"
+            restartPolicy: Never
+            containers:
+              - name: main
+                image: busybox:1.36
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -q -T 5 -O /dev/termination-log
+                    http://{{ net_server.result.status.podIP }}:8080/
+                    || echo "no answer from {{ net_server.result.status.podIP }}" > /dev/termination-log
+
+    - name: Wait for the client pod to finish.
+      kubernetes.core.k8s_info:
+        kind: Pod
+        name: net-client
+        namespace: "{{ probe_ns }}"
+      register: net_client
+      until: net_client.resources[0].status.phase | default('') in ['Succeeded', 'Failed']
+      retries: 24
+      delay: 5
+
+    # kubectl logs and kubectl exec make the API server connect to the
+    # kubelet, at the address the node registered. failed_when: false also
+    # resets the result's 'failed' flag, so success is judged by whether the
+    # module returned the log.
+    - name: Ask the API server for the logs of the pod on the worker.
+      kubernetes.core.k8s_log:
+        namespace: "{{ probe_ns }}"
+        name: net-client
+      register: worker_logs
+      failed_when: false
+
+    - name: Summarise the experiment.
+      ansible.builtin.debug:
+        msg:
+          - "Experiment: {{ experiment }}"
+          - >-
+            Management network between the nodes:
+            {{ 'isolated' if isolate_mgmt | default(false) | bool else 'open' }}
+          - >-
+            Pod to pod across nodes (Flannel):
+            {{ 'OK' if 'pod-network-ok' in client_result
+               else 'FAILED (' ~ client_result | trim ~ ')' }}
+          - >-
+            API server to worker kubelet (kubectl logs/exec):
+            {{ 'OK' if worker_logs.log is defined
+               else 'FAILED (' ~ worker_logs.msg | default('no log returned') ~ ')' }}
+      vars:
+        client_result: >-
+          {{ net_client.resources[0].status.containerStatuses[0].state.terminated.message | default('no result') }}
+
+    - name: Remove the test pods.
+      kubernetes.core.k8s:
+        state: absent
+        kind: Pod
+        namespace: "{{ probe_ns }}"
+        label_selectors:
+          - app=network-experiment
