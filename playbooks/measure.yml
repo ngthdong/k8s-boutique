@@ -1,0 +1,78 @@
+---
+# Measure what each service really uses, then derive requests and limits from
+# it. Run it with the application deployed and the load generator running:
+#
+#   ansible-playbook playbooks/loadgen.yml
+#   ansible-playbook playbooks/measure.yml
+#   ansible-playbook playbooks/loadgen.yml -e loadgen_state=absent
+#   ansible-playbook playbooks/deploy.yml       # applies vars/resources.yml
+#
+# Writes vars/resources.yml on the machine running Ansible; commit that file.
+
+- name: Measure the resource usage of the Online Boutique.
+  hosts: k8s_master
+  become: true
+
+  vars_files:
+    - ../vars/microservices.yml
+
+  vars:
+    measure_samples: 18
+    measure_interval: 10
+    loadgen_note: "{{ loadgen_users | default(10) }} simulated users"
+    apps: "{{ microservices | map(attribute='app') | list }}"
+
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+
+  tasks:
+    - name: Check that the load generator is running.
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: loadgenerator
+        namespace: "{{ microservices_namespace }}"
+      register: loadgen
+      failed_when: loadgen.resources | length == 0
+      changed_when: false
+
+    - name: Sample pod usage from the metrics API.
+      kubernetes.core.k8s_info:
+        api_version: metrics.k8s.io/v1beta1
+        kind: PodMetrics
+        namespace: "{{ microservices_namespace }}"
+      register: usage_samples
+      loop: "{{ range(measure_samples | int) | list }}"
+      loop_control:
+        label: "sample {{ item + 1 }}/{{ measure_samples }}"
+        pause: "{{ measure_interval | int }}"
+
+    - name: Compute the peak usage of each service.
+      ansible.builtin.set_fact:
+        usage_peaks: "{{ usage_samples.results | map(attribute='resources') | list | k8s_peak_usage(apps) }}"
+
+    - name: Check that every service was measured.
+      ansible.builtin.assert:
+        that: usage_peaks.keys() | sort == apps | sort
+        fail_msg: "No metrics for: {{ apps | difference(usage_peaks.keys() | list) }}"
+
+    - name: Derive requests and limits from the peaks.
+      ansible.builtin.set_fact:
+        recommended_resources: "{{ usage_peaks | k8s_recommend_resources }}"
+
+    - name: Write vars/resources.yml.
+      ansible.builtin.template:
+        src: resources.yml.j2
+        dest: "{{ playbook_dir }}/../vars/resources.yml"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+
+    - name: Show the measured peaks.
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.key }}: peak {{ item.value.cpu_m }}m CPU, {{ item.value.memory_mi }}Mi memory
+          -> {{ recommended_resources[item.key] }}
+      loop: "{{ usage_peaks | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"

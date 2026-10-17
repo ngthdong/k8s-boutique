@@ -1,0 +1,30 @@
+---
+# Start or stop simulated users, so that usage is measured under load.
+#
+#   ansible-playbook playbooks/loadgen.yml                       # start
+#   ansible-playbook playbooks/loadgen.yml -e loadgen_state=absent  # stop
+
+- name: Start or stop the load generator.
+  hosts: k8s_master
+  become: true
+
+  vars_files:
+    - ../vars/microservices.yml
+
+  vars:
+    loadgen_state: present
+    loadgen_users: 10
+
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+
+  tasks:
+    - name: Apply the load generator Deployment.
+      kubernetes.core.k8s:
+        state: "{{ loadgen_state }}"
+        template: loadgenerator.yml.j2
+        wait: "{{ loadgen_state == 'present' }}"
+        wait_condition:
+          type: Available
+          status: "True"
