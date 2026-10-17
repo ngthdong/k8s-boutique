@@ -11,3 +11,7 @@ containerEnvVars:
 
 servicePort: 8080
 serviceType: ClusterIP
+
+resources: {}
+readinessProbe: {}
+livenessProbe: {}

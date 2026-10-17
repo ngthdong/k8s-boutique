@@ -20,6 +20,18 @@ spec:
         volumeMounts:
         - name: {{ .Values.volumeName }}
           mountPath: {{.Values.containerMountPath }}
+        {{- with .Values.resources }}
+        resources:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.readinessProbe }}
+        readinessProbe:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.livenessProbe }}
+        livenessProbe:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
       volumes:
       - name: {{ .Values.volumeName }}
         emptyDir: {}

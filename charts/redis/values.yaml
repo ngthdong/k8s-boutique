@@ -7,3 +7,7 @@ volumeName: redis-data
 containerMountPath: /data
 
 servicePort: 6379
+
+resources: {}
+readinessProbe: {}
+livenessProbe: {}
