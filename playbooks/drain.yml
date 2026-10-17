@@ -1,0 +1,59 @@
+---
+# Drain a node, or bring it back, from Ansible.
+#
+#   ansible-playbook playbooks/drain.yml                        # drain node1
+#   ansible-playbook playbooks/drain.yml -e drain_action=uncordon
+#
+# On this cluster the drain cannot finish, and that is the point: see the
+# Scaling section of the report. The control plane is tainted, so the evicted
+# pods have nowhere to go, and the frontend PodDisruptionBudget refuses the
+# eviction that would leave fewer than minAvailable frontend pods running.
+
+- name: Drain or uncordon a node.
+  hosts: k8s_master
+  become: true
+
+  vars_files:
+    - ../vars/microservices.yml
+
+  vars:
+    drain_node: "{{ groups['k8s_nodes'][0] }}"
+    drain_action: drain
+    drain_timeout: 120
+
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ k8s_kubeconfig }}"
+
+  tasks:
+    - name: Drain or uncordon the node.
+      kubernetes.core.k8s_drain:
+        name: "{{ drain_node }}"
+        state: "{{ drain_action }}"
+        delete_options:
+          ignore_daemonsets: true      # Flannel and kube-proxy run on every node by design
+          delete_emptydir_data: true   # redis-cart keeps the carts in an emptyDir: they are lost
+          wait_timeout: "{{ drain_timeout | int }}"
+      register: drain_result
+      # A drain blocked by the PodDisruptionBudget is the expected result here;
+      # report it instead of stopping.
+      failed_when: false
+
+    - name: Report what the drain did.
+      ansible.builtin.debug:
+        msg: "{{ drain_result.msg | default(drain_result.result | default('done')) }}"
+
+    - name: Read the application pods.
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ microservices_namespace }}"
+      register: app_pods
+
+    - name: Show where each pod is now.
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.metadata.name }}: {{ item.status.phase }} on
+          {{ item.spec.nodeName | default('no node (Pending)') }}
+      loop: "{{ app_pods.resources | sort(attribute='metadata.name') }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
